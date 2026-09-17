@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from app.config.logger import setup_logging
 from app.domain.models.agent_state import AgentState
+from app.domain.prompts.injection_guard import wrap_untrusted
 from app.domain.prompts.sql_generation import (
     ANSWER_SYSTEM_PROMPT,
     EVALUATION_SYSTEM_PROMPT,
@@ -46,7 +47,7 @@ async def generate_sql(state: AgentState) -> AgentState:
         history = "\n\n".join(state.failed_attempts)
         human_content = (
             f"{state.question}\n\n"
-            f"Previous failed attempts:\n{history}\n\n"
+            f"Previous failed attempts:\n{wrap_untrusted(history)}\n\n"
             "Write a corrected query that answers the question and avoids all of "
             "the errors above."
         )
@@ -92,8 +93,8 @@ async def evaluate_sql_result(state: AgentState) -> AgentState:
         HumanMessage(
             content=(
                 f"Question: {state.question}\n"
-                f"SQL: {state.sql_query}\n"
-                f"Result:\n{state.sql_result}"
+                f"SQL:\n{wrap_untrusted(state.sql_query or '')}\n"
+                f"Result:\n{wrap_untrusted(state.sql_result or '')}"
             )
         ),
     ]
@@ -115,9 +116,16 @@ async def evaluate_sql_result(state: AgentState) -> AgentState:
 
 async def generate_answer(state: AgentState) -> AgentState:
     if state.sql_error:
-        human_content = f"Question: {state.question}\nThe query failed with error: {state.sql_error}"
+        human_content = (
+            f"Question: {state.question}\n"
+            f"The query failed with error:\n{wrap_untrusted(state.sql_error)}"
+        )
     else:
-        human_content = f"Question: {state.question}\nSQL: {state.sql_query}\nResult:\n{state.sql_result}"
+        human_content = (
+            f"Question: {state.question}\n"
+            f"SQL:\n{wrap_untrusted(state.sql_query or '')}\n"
+            f"Result:\n{wrap_untrusted(state.sql_result or '')}"
+        )
 
     llm = get_llm_adapter().get_llm_client()
     messages = [
