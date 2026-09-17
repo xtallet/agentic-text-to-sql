@@ -12,6 +12,8 @@ from app.infrastructure.di.dependencies import get_llm_adapter, get_sql_executor
 
 logger = setup_logging()(__name__)
 
+MAX_SQL_RETRIES = 2
+
 
 class SqlQuery(BaseModel):
     query: str
@@ -25,10 +27,30 @@ async def generate_sql(state: AgentState) -> AgentState:
     llm = get_llm_adapter().get_llm_client()
     structured_llm = llm.with_structured_output(SqlQuery)
 
+    if state.sql_error:
+        state.failed_attempts.append(
+            f"Attempt {len(state.failed_attempts) + 1}:\n"
+            f"SQL: {state.sql_query}\n"
+            f"Error: {state.sql_error}"
+        )
+
+    human_content = state.question
+    if state.failed_attempts:
+        history = "\n\n".join(state.failed_attempts)
+        human_content = (
+            f"{state.question}\n\n"
+            f"Previous failed attempts:\n{history}\n\n"
+            "Write a corrected query that answers the question and avoids all of "
+            "the errors above."
+        )
+
     messages = [
         SystemMessage(content=build_sql_system_prompt(state.schema_description)),
-        HumanMessage(content=state.question),
+        HumanMessage(content=human_content),
     ]
+
+    state.sql_error = None
+    state.sql_result = None
 
     try:
         result: SqlQuery = await structured_llm.ainvoke(messages)
@@ -76,6 +98,13 @@ async def generate_answer(state: AgentState) -> AgentState:
     return state
 
 
+def route_after_execute(state: AgentState) -> str:
+    if state.sql_error and state.retry_count < MAX_SQL_RETRIES:
+        state.retry_count += 1
+        return "generate_sql"
+    return "generate_answer"
+
+
 async def compile_graph():
     agent_graph = StateGraph(AgentState)
 
@@ -85,7 +114,11 @@ async def compile_graph():
 
     agent_graph.add_edge(START, "generate_sql")
     agent_graph.add_edge("generate_sql", "execute_sql")
-    agent_graph.add_edge("execute_sql", "generate_answer")
+    agent_graph.add_conditional_edges(
+        "execute_sql",
+        route_after_execute,
+        {"generate_sql": "generate_sql", "generate_answer": "generate_answer"},
+    )
     agent_graph.add_edge("generate_answer", END)
 
     return agent_graph.compile()

@@ -6,11 +6,13 @@ from langgraph.graph import END, START
 from app.domain.exceptions.sql_exceptions import UnsafeSqlError
 from app.domain.models.agent_state import AgentState
 from app.graph import (
+    MAX_SQL_RETRIES,
     SqlQuery,
     compile_graph,
     execute_sql,
     generate_answer,
     generate_sql,
+    route_after_execute,
 )
 
 
@@ -78,6 +80,68 @@ class TestGenerateSql:
 
         mock_get_sql_executor.return_value.get_schema.assert_not_called()
 
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    @patch("app.graph.get_sql_executor")
+    async def test_retry_includes_previous_error_and_clears_it(
+        self, mock_get_sql_executor, mock_get_llm_adapter
+    ):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = SqlQuery(
+            query="SELECT * FROM Artist LIMIT 1"
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="How many artists are there?",
+            schema_description="cached schema",
+            sql_query="SELECT * FROM Artsit",
+            sql_error="no such table: Artsit",
+            sql_result=None,
+        )
+        result = await generate_sql(state)
+
+        human_message = structured_llm.ainvoke.call_args[0][0][1]
+        assert "SELECT * FROM Artsit" in human_message.content
+        assert "no such table: Artsit" in human_message.content
+        assert result.sql_query == "SELECT * FROM Artist LIMIT 1"
+        assert result.sql_error is None
+        assert result.failed_attempts == [
+            "Attempt 1:\nSQL: SELECT * FROM Artsit\nError: no such table: Artsit"
+        ]
+
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    @patch("app.graph.get_sql_executor")
+    async def test_second_retry_accumulates_both_failed_attempts(
+        self, mock_get_sql_executor, mock_get_llm_adapter
+    ):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = SqlQuery(query="SELECT 1")
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="How many artists are there?",
+            schema_description="cached schema",
+            sql_query="SELECT COUNT(*) FROM Artist WHERE",
+            sql_error="syntax error",
+            failed_attempts=[
+                "Attempt 1:\nSQL: SELECT * FROM Artsit\nError: no such table: Artsit"
+            ],
+        )
+        result = await generate_sql(state)
+
+        human_message = structured_llm.ainvoke.call_args[0][0][1]
+        assert "Attempt 1" in human_message.content
+        assert "no such table: Artsit" in human_message.content
+        assert "Attempt 2" in human_message.content
+        assert "syntax error" in human_message.content
+        assert len(result.failed_attempts) == 2
+
 
 class TestExecuteSql:
     @pytest.mark.asyncio
@@ -114,6 +178,22 @@ class TestExecuteSql:
 
         mock_get_sql_executor.return_value.execute.assert_not_called()
         assert result.sql_error == "could not generate SQL"
+
+
+class TestRouteAfterExecute:
+    def test_routes_to_generate_answer_when_no_error(self):
+        state = AgentState(question="q", sql_result="id\n1")
+        assert route_after_execute(state) == "generate_answer"
+
+    def test_routes_to_generate_sql_and_increments_retry_count_on_error(self):
+        state = AgentState(question="q", sql_error="boom", retry_count=0)
+        assert route_after_execute(state) == "generate_sql"
+        assert state.retry_count == 1
+
+    def test_routes_to_generate_answer_once_retries_are_exhausted(self):
+        state = AgentState(question="q", sql_error="boom", retry_count=MAX_SQL_RETRIES)
+        assert route_after_execute(state) == "generate_answer"
+        assert state.retry_count == MAX_SQL_RETRIES
 
 
 class TestGenerateAnswer:
@@ -166,8 +246,12 @@ class TestCompileGraph:
 
         mock_graph.add_edge.assert_any_call(START, "generate_sql")
         mock_graph.add_edge.assert_any_call("generate_sql", "execute_sql")
-        mock_graph.add_edge.assert_any_call("execute_sql", "generate_answer")
         mock_graph.add_edge.assert_any_call("generate_answer", END)
+        mock_graph.add_conditional_edges.assert_called_once_with(
+            "execute_sql",
+            route_after_execute,
+            {"generate_sql": "generate_sql", "generate_answer": "generate_answer"},
+        )
 
         mock_graph.compile.assert_called_once()
         assert result == mock_compiled_graph

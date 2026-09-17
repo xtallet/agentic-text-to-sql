@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "dependencies": ["."],
+  "env": ".env",
+  "python_version": "3.11",
+  "graphs": {
+    "text_to_sql_graph": "app.graph:compile_graph"
+  },
+  "assistants": {
+    "agent": {
+      "graph_id": "text_to_sql_graph",
+      "name": "Text-to-SQL Agent",
+      "description": "Agent that answers natural language questions by generating and executing SQL against the Chinook database."
+    }
+  }
+}
