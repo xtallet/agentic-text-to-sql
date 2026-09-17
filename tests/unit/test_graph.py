@@ -6,14 +6,18 @@ from langgraph.graph import END, START
 from app.domain.exceptions.sql_exceptions import UnsafeSqlError
 from app.domain.models.agent_state import AgentState
 from app.graph import (
+    MAX_ANSWER_RETRIES,
     MAX_SQL_RETRIES,
+    AnswerEvaluation,
     SqlEvaluation,
     SqlQuery,
     compile_graph,
+    evaluate_answer,
     evaluate_sql_result,
     execute_sql,
     generate_answer,
     generate_sql,
+    route_after_answer_evaluation,
     route_after_evaluate,
     route_after_execute,
 )
@@ -206,6 +210,7 @@ class TestEvaluateSqlResult:
         result = await evaluate_sql_result(state)
 
         assert result.sql_error is None
+        assert result.sql_evaluation_reason == "Matches the question"
 
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
@@ -307,6 +312,117 @@ class TestGenerateAnswer:
 
         assert "couldn't generate an answer" in result.answer
 
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_retry_includes_previous_answer_and_clears_error(
+        self, mock_get_llm_adapter
+    ):
+        llm = AsyncMock()
+        llm.ainvoke.return_value = MagicMock(content="AC/DC has 22 albums.")
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="q",
+            sql_query="SELECT 1",
+            sql_result="id\n1",
+            answer="AC/DC has 25 albums.",
+            answer_error="The number 25 is not present in the result",
+        )
+        result = await generate_answer(state)
+
+        human_message = llm.ainvoke.call_args[0][0][1]
+        assert "AC/DC has 25 albums." in human_message.content
+        assert "not present in the result" in human_message.content
+        assert result.answer == "AC/DC has 22 albums."
+        assert result.answer_error is None
+        assert result.answer_retry_count == 1
+
+
+class TestEvaluateAnswer:
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_valid_answer_leaves_answer_error_unset(self, mock_get_llm_adapter):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = AnswerEvaluation(
+            is_valid=True, reason="Faithful to the result"
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="q",
+            sql_query="SELECT COUNT(*) FROM Artist",
+            sql_result="275",
+            answer="There are 275 artists.",
+        )
+        result = await evaluate_answer(state)
+
+        assert result.answer_error is None
+        assert result.answer_evaluation_reason == "Faithful to the result"
+
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_invalid_answer_sets_answer_error_with_reason(
+        self, mock_get_llm_adapter
+    ):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = AnswerEvaluation(
+            is_valid=False, reason="Invented a number not present in the result"
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="q",
+            sql_query="SELECT COUNT(*) FROM Artist",
+            sql_result="275",
+            answer="There are 999 artists.",
+        )
+        result = await evaluate_answer(state)
+
+        assert "Invented a number not present in the result" in result.answer_error
+
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_evaluator_failure_fails_open(self, mock_get_llm_adapter):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.side_effect = RuntimeError("LLM is down")
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="q",
+            sql_query="SELECT COUNT(*) FROM Artist",
+            sql_result="275",
+            answer="There are 275 artists.",
+        )
+        result = await evaluate_answer(state)
+
+        assert result.answer_error is None
+
+
+class TestRouteAfterAnswerEvaluation:
+    def test_routes_to_end_when_no_error(self):
+        state = AgentState(question="q", answer="ok")
+        assert route_after_answer_evaluation(state) == "end"
+
+    def test_routes_to_generate_answer_when_retries_remain(self):
+        state = AgentState(
+            question="q", answer_error="bad answer", answer_retry_count=0
+        )
+        assert route_after_answer_evaluation(state) == "generate_answer"
+
+    def test_routes_to_end_once_retries_are_exhausted(self):
+        state = AgentState(
+            question="q",
+            answer_error="bad answer",
+            answer_retry_count=MAX_ANSWER_RETRIES,
+        )
+        assert route_after_answer_evaluation(state) == "end"
+
 
 class TestCompileGraph:
     @pytest.mark.asyncio
@@ -326,6 +442,7 @@ class TestCompileGraph:
             ("execute_sql", execute_sql),
             ("evaluate_sql_result", evaluate_sql_result),
             ("generate_answer", generate_answer),
+            ("evaluate_answer", evaluate_answer),
         ]
         for name, node in expected_nodes:
             mock_graph.add_node.assert_any_call(name, node)
@@ -333,7 +450,7 @@ class TestCompileGraph:
 
         mock_graph.add_edge.assert_any_call(START, "generate_sql")
         mock_graph.add_edge.assert_any_call("generate_sql", "execute_sql")
-        mock_graph.add_edge.assert_any_call("generate_answer", END)
+        mock_graph.add_edge.assert_any_call("generate_answer", "evaluate_answer")
         mock_graph.add_conditional_edges.assert_any_call(
             "execute_sql",
             route_after_execute,
@@ -348,7 +465,12 @@ class TestCompileGraph:
             route_after_evaluate,
             {"generate_sql": "generate_sql", "generate_answer": "generate_answer"},
         )
-        assert mock_graph.add_conditional_edges.call_count == 2
+        mock_graph.add_conditional_edges.assert_any_call(
+            "evaluate_answer",
+            route_after_answer_evaluation,
+            {"generate_answer": "generate_answer", "end": END},
+        )
+        assert mock_graph.add_conditional_edges.call_count == 3
 
         mock_graph.compile.assert_called_once()
         assert result == mock_compiled_graph

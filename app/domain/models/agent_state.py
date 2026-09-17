@@ -9,4 +9,8 @@ class AgentState(BaseModel):
     sql_error: str | None = None
     retry_count: int = 0
     failed_attempts: list[str] = Field(default_factory=list)
+    sql_evaluation_reason: str | None = None
     answer: str | None = None
+    answer_error: str | None = None
+    answer_retry_count: int = 0
+    answer_evaluation_reason: str | None = None

@@ -6,6 +6,7 @@ from app.config.logger import setup_logging
 from app.domain.models.agent_state import AgentState
 from app.domain.prompts.injection_guard import wrap_untrusted
 from app.domain.prompts.sql_generation import (
+    ANSWER_EVALUATION_SYSTEM_PROMPT,
     ANSWER_SYSTEM_PROMPT,
     EVALUATION_SYSTEM_PROMPT,
     build_sql_system_prompt,
@@ -15,6 +16,7 @@ from app.infrastructure.di.dependencies import get_llm_adapter, get_sql_executor
 logger = setup_logging()(__name__)
 
 MAX_SQL_RETRIES = 2
+MAX_ANSWER_RETRIES = 1
 
 
 class SqlQuery(BaseModel):
@@ -22,6 +24,11 @@ class SqlQuery(BaseModel):
 
 
 class SqlEvaluation(BaseModel):
+    is_valid: bool
+    reason: str
+
+
+class AnswerEvaluation(BaseModel):
     is_valid: bool
     reason: str
 
@@ -59,6 +66,7 @@ async def generate_sql(state: AgentState) -> AgentState:
 
     state.sql_error = None
     state.sql_result = None
+    state.sql_evaluation_reason = None
 
     try:
         result: SqlQuery = await structured_llm.ainvoke(messages)
@@ -101,6 +109,7 @@ async def evaluate_sql_result(state: AgentState) -> AgentState:
 
     try:
         evaluation: SqlEvaluation = await structured_llm.ainvoke(messages)
+        state.sql_evaluation_reason = evaluation.reason
         if not evaluation.is_valid:
             state.sql_error = (
                 f"Self-evaluation rejected the result: {evaluation.reason}"
@@ -127,6 +136,18 @@ async def generate_answer(state: AgentState) -> AgentState:
             f"Result:\n{wrap_untrusted(state.sql_result or '')}"
         )
 
+    if state.answer_error:
+        state.answer_retry_count += 1
+        rejection = f"Previous answer: {state.answer}\nReason: {state.answer_error}"
+        human_content += (
+            f"\n\nYour previous answer was rejected during review:\n"
+            f"{wrap_untrusted(rejection)}\n\n"
+            "Write a corrected answer that addresses this issue."
+        )
+
+    state.answer_error = None
+    state.answer_evaluation_reason = None
+
     llm = get_llm_adapter().get_llm_client()
     messages = [
         SystemMessage(content=ANSWER_SYSTEM_PROMPT),
@@ -139,6 +160,44 @@ async def generate_answer(state: AgentState) -> AgentState:
     except Exception:
         logger.exception(f"Failed to generate answer for question '{state.question}'")
         state.answer = "Sorry, I couldn't generate an answer due to an internal error."
+
+    return state
+
+
+async def evaluate_answer(state: AgentState) -> AgentState:
+    llm = get_llm_adapter().get_llm_client()
+    structured_llm = llm.with_structured_output(AnswerEvaluation)
+
+    if state.sql_error:
+        context = f"The query failed with error:\n{wrap_untrusted(state.sql_error)}"
+    else:
+        context = (
+            f"SQL:\n{wrap_untrusted(state.sql_query or '')}\n"
+            f"Result:\n{wrap_untrusted(state.sql_result or '')}"
+        )
+
+    messages = [
+        SystemMessage(content=ANSWER_EVALUATION_SYSTEM_PROMPT),
+        HumanMessage(
+            content=(
+                f"Question: {state.question}\n"
+                f"{context}\n"
+                f"Generated answer:\n{wrap_untrusted(state.answer or '')}"
+            )
+        ),
+    ]
+
+    try:
+        evaluation: AnswerEvaluation = await structured_llm.ainvoke(messages)
+        state.answer_evaluation_reason = evaluation.reason
+        if not evaluation.is_valid:
+            logger.warning(f"Answer evaluation rejected: {evaluation.reason}")
+            state.answer_error = evaluation.reason
+    except Exception:
+        # Fail open: an evaluator error shouldn't block an otherwise valid answer.
+        logger.exception(
+            f"Failed to self-evaluate generated answer for question '{state.question}'"
+        )
 
     return state
 
@@ -161,6 +220,12 @@ def route_after_evaluate(state: AgentState) -> str:
     return "generate_answer"
 
 
+def route_after_answer_evaluation(state: AgentState) -> str:
+    if state.answer_error and state.answer_retry_count < MAX_ANSWER_RETRIES:
+        return "generate_answer"
+    return "end"
+
+
 async def compile_graph():
     agent_graph = StateGraph(AgentState)
 
@@ -168,6 +233,7 @@ async def compile_graph():
     agent_graph.add_node("execute_sql", execute_sql)
     agent_graph.add_node("evaluate_sql_result", evaluate_sql_result)
     agent_graph.add_node("generate_answer", generate_answer)
+    agent_graph.add_node("evaluate_answer", evaluate_answer)
 
     agent_graph.add_edge(START, "generate_sql")
     agent_graph.add_edge("generate_sql", "execute_sql")
@@ -185,6 +251,11 @@ async def compile_graph():
         route_after_evaluate,
         {"generate_sql": "generate_sql", "generate_answer": "generate_answer"},
     )
-    agent_graph.add_edge("generate_answer", END)
+    agent_graph.add_edge("generate_answer", "evaluate_answer")
+    agent_graph.add_conditional_edges(
+        "evaluate_answer",
+        route_after_answer_evaluation,
+        {"generate_answer": "generate_answer", "end": END},
+    )
 
     return agent_graph.compile()
