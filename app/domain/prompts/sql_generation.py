@@ -14,6 +14,23 @@ Rules:
 """
 
 
+EVALUATION_SYSTEM_PROMPT = """
+You are a strict reviewer checking whether a SQL query result actually answers a user's
+natural language question about the Chinook music store database.
+
+Given the question, the SQL query that was run, and its result, decide whether the result
+plausibly and completely answers the question.
+
+Mark it invalid if:
+- The result is empty when the question implies matching data should exist.
+- The query only partially answers the question (e.g., missing a requested aggregation,
+  ordering, or filter).
+- The query answers a different question than the one asked.
+
+Do not invent facts. Base your judgement only on the question, the query, and the result.
+"""
+
+
 ANSWER_SYSTEM_PROMPT = """
 You are a helpful assistant that answers business questions about a music store (the Chinook
 database) in natural language.

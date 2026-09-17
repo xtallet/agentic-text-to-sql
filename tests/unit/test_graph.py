@@ -7,11 +7,14 @@ from app.domain.exceptions.sql_exceptions import UnsafeSqlError
 from app.domain.models.agent_state import AgentState
 from app.graph import (
     MAX_SQL_RETRIES,
+    SqlEvaluation,
     SqlQuery,
     compile_graph,
+    evaluate_sql_result,
     execute_sql,
     generate_answer,
     generate_sql,
+    route_after_evaluate,
     route_after_execute,
 )
 
@@ -111,6 +114,7 @@ class TestGenerateSql:
         assert result.failed_attempts == [
             "Attempt 1:\nSQL: SELECT * FROM Artsit\nError: no such table: Artsit"
         ]
+        assert result.retry_count == 1
 
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
@@ -129,6 +133,7 @@ class TestGenerateSql:
             schema_description="cached schema",
             sql_query="SELECT COUNT(*) FROM Artist WHERE",
             sql_error="syntax error",
+            retry_count=1,
             failed_attempts=[
                 "Attempt 1:\nSQL: SELECT * FROM Artsit\nError: no such table: Artsit"
             ],
@@ -141,6 +146,7 @@ class TestGenerateSql:
         assert "Attempt 2" in human_message.content
         assert "syntax error" in human_message.content
         assert len(result.failed_attempts) == 2
+        assert result.retry_count == 2
 
 
 class TestExecuteSql:
@@ -180,20 +186,100 @@ class TestExecuteSql:
         assert result.sql_error == "could not generate SQL"
 
 
-class TestRouteAfterExecute:
-    def test_routes_to_generate_answer_when_no_error(self):
-        state = AgentState(question="q", sql_result="id\n1")
-        assert route_after_execute(state) == "generate_answer"
+class TestEvaluateSqlResult:
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_valid_result_leaves_sql_error_unset(self, mock_get_llm_adapter):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = SqlEvaluation(
+            is_valid=True, reason="Matches the question"
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
 
-    def test_routes_to_generate_sql_and_increments_retry_count_on_error(self):
+        state = AgentState(
+            question="How many artists are there?",
+            sql_query="SELECT COUNT(*) FROM Artist",
+            sql_result="275",
+        )
+        result = await evaluate_sql_result(state)
+
+        assert result.sql_error is None
+
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_invalid_result_sets_sql_error_with_reason(
+        self, mock_get_llm_adapter
+    ):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = SqlEvaluation(
+            is_valid=False, reason="Result is empty but artists clearly exist"
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="How many artists are there?",
+            sql_query="SELECT COUNT(*) FROM Artist WHERE 1=0",
+            sql_result="",
+        )
+        result = await evaluate_sql_result(state)
+
+        assert "Result is empty but artists clearly exist" in result.sql_error
+
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_evaluator_failure_fails_open(self, mock_get_llm_adapter):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.side_effect = RuntimeError("LLM is down")
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="How many artists are there?",
+            sql_query="SELECT COUNT(*) FROM Artist",
+            sql_result="275",
+        )
+        result = await evaluate_sql_result(state)
+
+        assert result.sql_error is None
+
+
+class TestRouteAfterExecute:
+    def test_routes_to_evaluate_sql_result_when_no_error(self):
+        state = AgentState(question="q", sql_result="id\n1")
+        assert route_after_execute(state) == "evaluate_sql_result"
+
+    def test_routes_to_generate_sql_when_retries_remain(self):
         state = AgentState(question="q", sql_error="boom", retry_count=0)
         assert route_after_execute(state) == "generate_sql"
-        assert state.retry_count == 1
 
     def test_routes_to_generate_answer_once_retries_are_exhausted(self):
         state = AgentState(question="q", sql_error="boom", retry_count=MAX_SQL_RETRIES)
         assert route_after_execute(state) == "generate_answer"
-        assert state.retry_count == MAX_SQL_RETRIES
+
+
+class TestRouteAfterEvaluate:
+    def test_routes_to_generate_answer_when_no_error(self):
+        state = AgentState(question="q", sql_result="id\n1")
+        assert route_after_evaluate(state) == "generate_answer"
+
+    def test_routes_to_generate_sql_when_retries_remain(self):
+        state = AgentState(
+            question="q", sql_error="Self-evaluation rejected", retry_count=0
+        )
+        assert route_after_evaluate(state) == "generate_sql"
+
+    def test_routes_to_generate_answer_once_retries_are_exhausted(self):
+        state = AgentState(
+            question="q",
+            sql_error="Self-evaluation rejected",
+            retry_count=MAX_SQL_RETRIES,
+        )
+        assert route_after_evaluate(state) == "generate_answer"
 
 
 class TestGenerateAnswer:
@@ -238,6 +324,7 @@ class TestCompileGraph:
         expected_nodes = [
             ("generate_sql", generate_sql),
             ("execute_sql", execute_sql),
+            ("evaluate_sql_result", evaluate_sql_result),
             ("generate_answer", generate_answer),
         ]
         for name, node in expected_nodes:
@@ -247,11 +334,21 @@ class TestCompileGraph:
         mock_graph.add_edge.assert_any_call(START, "generate_sql")
         mock_graph.add_edge.assert_any_call("generate_sql", "execute_sql")
         mock_graph.add_edge.assert_any_call("generate_answer", END)
-        mock_graph.add_conditional_edges.assert_called_once_with(
+        mock_graph.add_conditional_edges.assert_any_call(
             "execute_sql",
             route_after_execute,
+            {
+                "generate_sql": "generate_sql",
+                "evaluate_sql_result": "evaluate_sql_result",
+                "generate_answer": "generate_answer",
+            },
+        )
+        mock_graph.add_conditional_edges.assert_any_call(
+            "evaluate_sql_result",
+            route_after_evaluate,
             {"generate_sql": "generate_sql", "generate_answer": "generate_answer"},
         )
+        assert mock_graph.add_conditional_edges.call_count == 2
 
         mock_graph.compile.assert_called_once()
         assert result == mock_compiled_graph
