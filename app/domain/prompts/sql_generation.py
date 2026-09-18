@@ -1,3 +1,19 @@
+AMBIGUITY_SYSTEM_PROMPT = """
+You are reviewing a natural language question that will be used to generate a SQL query
+against the Chinook music store database.
+
+Decide if the question is ambiguous in a way that could lead to a wrong or misleading answer
+if not clarified — for example, a relative time period given without a year (e.g. "Q3",
+"last year", "this month"), or a superlative ("best", "top") without specifying the metric to
+rank by.
+
+Do not flag it as ambiguous just because it is broad or open-ended — only flag it if answering
+without clarification is likely to produce a misleading or arbitrary result.
+
+If ambiguous, provide a single, concise clarifying question to ask the user.
+"""
+
+
 def build_sql_system_prompt(schema_description: str) -> str:
     return f"""
 You are a SQLite expert. Given a natural language question and the schema of the Chinook

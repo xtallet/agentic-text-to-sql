@@ -1,11 +1,14 @@
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from app.config.logger import setup_logging
 from app.domain.models.agent_state import AgentState
 from app.domain.prompts.injection_guard import wrap_untrusted
 from app.domain.prompts.sql_generation import (
+    AMBIGUITY_SYSTEM_PROMPT,
     ANSWER_EVALUATION_SYSTEM_PROMPT,
     ANSWER_SYSTEM_PROMPT,
     EVALUATION_SYSTEM_PROMPT,
@@ -34,6 +37,33 @@ class AnswerEvaluation(BaseModel):
     reason: str
 
 
+class AmbiguityCheck(BaseModel):
+    is_ambiguous: bool
+    clarifying_question: str | None = None
+
+
+async def check_ambiguity(state: AgentState) -> AgentState:
+    llm = get_llm_adapter().get_llm_client()
+    structured_llm = llm.with_structured_output(AmbiguityCheck)
+
+    messages = [
+        SystemMessage(content=AMBIGUITY_SYSTEM_PROMPT),
+        HumanMessage(content=state.question),
+    ]
+
+    try:
+        check: AmbiguityCheck = await structured_llm.ainvoke(messages)
+    except Exception:
+        # Fail open: an ambiguity-check error shouldn't block the question.
+        logger.exception(f"Failed to check ambiguity for question '{state.question}'")
+        return state
+
+    if check.is_ambiguous and check.clarifying_question:
+        state.clarification = interrupt({"question": check.clarifying_question})
+
+    return state
+
+
 async def generate_sql(state: AgentState) -> AgentState:
     sql_executor = get_sql_executor()
     if state.schema_description is None:
@@ -50,11 +80,15 @@ async def generate_sql(state: AgentState) -> AgentState:
             f"Error: {state.sql_error}"
         )
 
-    human_content = state.question
+    question_context = state.question
+    if state.clarification:
+        question_context += f"\nUser clarification: {state.clarification}"
+
+    human_content = question_context
     if state.failed_attempts:
         history = "\n\n".join(state.failed_attempts)
         human_content = (
-            f"{state.question}\n\n"
+            f"{question_context}\n\n"
             f"Previous failed attempts:\n{wrap_untrusted(history)}\n\n"
             "Write a corrected query that answers the question and avoids all of "
             "the errors above."
@@ -231,13 +265,15 @@ def route_after_answer_evaluation(state: AgentState) -> str:
 async def compile_graph():
     agent_graph = StateGraph(AgentState)
 
+    agent_graph.add_node("check_ambiguity", check_ambiguity)
     agent_graph.add_node("generate_sql", generate_sql)
     agent_graph.add_node("execute_sql", execute_sql)
     agent_graph.add_node("evaluate_sql_result", evaluate_sql_result)
     agent_graph.add_node("generate_answer", generate_answer)
     agent_graph.add_node("evaluate_answer", evaluate_answer)
 
-    agent_graph.add_edge(START, "generate_sql")
+    agent_graph.add_edge(START, "check_ambiguity")
+    agent_graph.add_edge("check_ambiguity", "generate_sql")
     agent_graph.add_edge("generate_sql", "execute_sql")
     agent_graph.add_conditional_edges(
         "execute_sql",
@@ -260,4 +296,4 @@ async def compile_graph():
         {"generate_answer": "generate_answer", "end": END},
     )
 
-    return agent_graph.compile()
+    return agent_graph.compile(checkpointer=InMemorySaver())

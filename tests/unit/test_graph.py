@@ -1,6 +1,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START
 
 from app.domain.exceptions.sql_exceptions import UnsafeSqlError
@@ -8,9 +9,11 @@ from app.domain.models.agent_state import AgentState
 from app.graph import (
     MAX_ANSWER_RETRIES,
     MAX_SQL_RETRIES,
+    AmbiguityCheck,
     AnswerEvaluation,
     SqlEvaluation,
     SqlQuery,
+    check_ambiguity,
     compile_graph,
     evaluate_answer,
     evaluate_sql_result,
@@ -21,6 +24,62 @@ from app.graph import (
     route_after_evaluate,
     route_after_execute,
 )
+
+
+class TestCheckAmbiguity:
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_unambiguous_question_leaves_clarification_unset(
+        self, mock_get_llm_adapter
+    ):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = AmbiguityCheck(is_ambiguous=False)
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(question="How many tracks are there?")
+        result = await check_ambiguity(state)
+
+        assert result.clarification is None
+
+    @pytest.mark.asyncio
+    @patch("app.graph.interrupt")
+    @patch("app.graph.get_llm_adapter")
+    async def test_ambiguous_question_interrupts_and_stores_clarification(
+        self, mock_get_llm_adapter, mock_interrupt
+    ):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = AmbiguityCheck(
+            is_ambiguous=True,
+            clarifying_question="Which year's Q3 do you mean?",
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+        mock_interrupt.return_value = "2012"
+
+        state = AgentState(question="Top employee by invoices in Q3?")
+        result = await check_ambiguity(state)
+
+        mock_interrupt.assert_called_once_with(
+            {"question": "Which year's Q3 do you mean?"}
+        )
+        assert result.clarification == "2012"
+
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_check_failure_fails_open(self, mock_get_llm_adapter):
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.side_effect = RuntimeError("LLM is down")
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(question="How many tracks are there?")
+        result = await check_ambiguity(state)
+
+        assert result.clarification is None
 
 
 class TestGenerateSql:
@@ -44,6 +103,30 @@ class TestGenerateSql:
         assert result.sql_query == "SELECT * FROM Artist"
         assert result.schema_description == "CREATE TABLE Artist (...)"
         assert result.sql_error is None
+
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    @patch("app.graph.get_sql_executor")
+    async def test_includes_user_clarification_in_prompt(
+        self, mock_get_sql_executor, mock_get_llm_adapter
+    ):
+        mock_get_sql_executor.return_value.get_schema.return_value = (
+            "CREATE TABLE Invoice (...)"
+        )
+
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = SqlQuery(query="SELECT * FROM Invoice")
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(
+            question="Top employee by invoices in Q3?", clarification="2012"
+        )
+        await generate_sql(state)
+
+        human_message = structured_llm.ainvoke.call_args[0][0][1]
+        assert "User clarification: 2012" in human_message.content
 
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
@@ -462,6 +545,7 @@ class TestCompileGraph:
         mock_state_graph.assert_called_once_with(AgentState)
 
         expected_nodes = [
+            ("check_ambiguity", check_ambiguity),
             ("generate_sql", generate_sql),
             ("execute_sql", execute_sql),
             ("evaluate_sql_result", evaluate_sql_result),
@@ -472,7 +556,8 @@ class TestCompileGraph:
             mock_graph.add_node.assert_any_call(name, node)
         assert mock_graph.add_node.call_count == len(expected_nodes)
 
-        mock_graph.add_edge.assert_any_call(START, "generate_sql")
+        mock_graph.add_edge.assert_any_call(START, "check_ambiguity")
+        mock_graph.add_edge.assert_any_call("check_ambiguity", "generate_sql")
         mock_graph.add_edge.assert_any_call("generate_sql", "execute_sql")
         mock_graph.add_edge.assert_any_call("generate_answer", "evaluate_answer")
         mock_graph.add_conditional_edges.assert_any_call(
@@ -497,4 +582,6 @@ class TestCompileGraph:
         assert mock_graph.add_conditional_edges.call_count == 3
 
         mock_graph.compile.assert_called_once()
+        _, compile_kwargs = mock_graph.compile.call_args
+        assert isinstance(compile_kwargs["checkpointer"], InMemorySaver)
         assert result == mock_compiled_graph

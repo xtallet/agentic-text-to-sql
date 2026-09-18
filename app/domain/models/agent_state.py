@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 
 class AgentState(BaseModel):
     question: str
+    clarification: str | None = None
     schema_description: str | None = None
     sql_query: str | None = None
     sql_result: str | None = None
