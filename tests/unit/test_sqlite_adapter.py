@@ -1,9 +1,11 @@
+from pathlib import Path
+
 import pytest
 
 from app.domain.exceptions.sql_exceptions import UnsafeSqlError
 from app.infrastructure.adapters.sqlite_adapter import SqliteAdapter
 
-DB_PATH = "data/chinook.db"
+DB_PATH = str(Path(__file__).resolve().parent.parent.parent / "data" / "chinook.db")
 
 
 @pytest.fixture
