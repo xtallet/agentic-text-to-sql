@@ -6,6 +6,9 @@ from app.domain.ports.sql_executor_port import SqlExecutorPort
 
 MAX_ROWS = 200
 
+PII_COLUMNS = {"email", "phone", "fax", "address", "birthdate", "postalcode"}
+REDACTED = "[REDACTED]"
+
 
 class SqliteAdapter(SqlExecutorPort):
     db_path: str
@@ -36,6 +39,15 @@ class SqliteAdapter(SqlExecutorPort):
         if not rows:
             return "(no rows returned)"
 
+        pii_indexes = {
+            i for i, name in enumerate(columns) if name.lower() in PII_COLUMNS
+        }
+
         lines = [", ".join(columns)]
-        lines.extend(", ".join(str(value) for value in row) for row in rows)
+        for row in rows:
+            values = [
+                REDACTED if i in pii_indexes and value is not None else str(value)
+                for i, value in enumerate(row)
+            ]
+            lines.append(", ".join(values))
         return "\n".join(lines)

@@ -11,6 +11,7 @@ from app.domain.prompts.sql_generation import (
     EVALUATION_SYSTEM_PROMPT,
     build_sql_system_prompt,
 )
+from app.domain.validators.schema_validator import validate_sql_schema
 from app.infrastructure.di.dependencies import get_llm_adapter, get_sql_executor
 
 logger = setup_logging()(__name__)
@@ -71,6 +72,7 @@ async def generate_sql(state: AgentState) -> AgentState:
     try:
         result: SqlQuery = await structured_llm.ainvoke(messages)
         state.sql_query = result.query
+        state.sql_error = validate_sql_schema(result.query, state.schema_description)
     except Exception as e:
         logger.exception(f"Failed to generate SQL for question '{state.question}'")
         state.sql_error = str(e)

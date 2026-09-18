@@ -103,7 +103,7 @@ class TestGenerateSql:
 
         state = AgentState(
             question="How many artists are there?",
-            schema_description="cached schema",
+            schema_description="CREATE TABLE Artist (...)",
             sql_query="SELECT * FROM Artsit",
             sql_error="no such table: Artsit",
             sql_result=None,
@@ -151,6 +151,30 @@ class TestGenerateSql:
         assert "syntax error" in human_message.content
         assert len(result.failed_attempts) == 2
         assert result.retry_count == 2
+
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    @patch("app.graph.get_sql_executor")
+    async def test_rejects_query_referencing_unknown_table(
+        self, mock_get_sql_executor, mock_get_llm_adapter
+    ):
+        mock_get_sql_executor.return_value.get_schema.return_value = (
+            "CREATE TABLE Artist (...)"
+        )
+
+        structured_llm = AsyncMock()
+        structured_llm.ainvoke.return_value = SqlQuery(
+            query="SELECT * FROM NotExistingTable"
+        )
+        llm = MagicMock()
+        llm.with_structured_output.return_value = structured_llm
+        mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
+
+        state = AgentState(question="How many artists are there?")
+        result = await generate_sql(state)
+
+        assert result.sql_query == "SELECT * FROM NotExistingTable"
+        assert "notexistingtable" in result.sql_error.lower()
 
 
 class TestExecuteSql:

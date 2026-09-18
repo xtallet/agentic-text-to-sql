@@ -25,6 +25,21 @@ class TestSqliteAdapter:
         assert "Name" in result
         assert "AC/DC" in result
 
+    def test_execute_redacts_pii_columns(self, adapter):
+        result = adapter.execute(
+            "SELECT FirstName, Email, Phone FROM Customer WHERE CustomerId = 1"
+        )
+
+        assert "[REDACTED]" in result
+        assert "@" not in result
+
+    def test_execute_does_not_redact_non_pii_columns(self, adapter):
+        result = adapter.execute(
+            "SELECT FirstName, LastName FROM Customer WHERE CustomerId = 1"
+        )
+
+        assert "[REDACTED]" not in result
+
     @pytest.mark.parametrize(
         "query",
         [
