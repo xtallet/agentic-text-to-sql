@@ -10,6 +10,12 @@ PII_COLUMNS = {"email", "phone", "fax", "address", "birthdate", "postalcode"}
 REDACTED = "[REDACTED]"
 
 
+def _format_value(value: object) -> str:
+    if isinstance(value, float):
+        return str(round(value, 2))
+    return str(value)
+
+
 class SqliteAdapter(SqlExecutorPort):
     db_path: str
 
@@ -46,7 +52,9 @@ class SqliteAdapter(SqlExecutorPort):
         lines = [", ".join(columns)]
         for row in rows:
             values = [
-                REDACTED if i in pii_indexes and value is not None else str(value)
+                REDACTED
+                if i in pii_indexes and value is not None
+                else _format_value(value)
                 for i, value in enumerate(row)
             ]
             lines.append(", ".join(values))

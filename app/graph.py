@@ -8,10 +8,10 @@ from app.config.logger import setup_logging
 from app.domain.models.agent_state import AgentState
 from app.domain.prompts.injection_guard import wrap_untrusted
 from app.domain.prompts.sql_generation import (
-    AMBIGUITY_SYSTEM_PROMPT,
     ANSWER_EVALUATION_SYSTEM_PROMPT,
     ANSWER_SYSTEM_PROMPT,
     EVALUATION_SYSTEM_PROMPT,
+    build_ambiguity_system_prompt,
     build_sql_system_prompt,
 )
 from app.domain.validators.schema_validator import validate_sql_schema
@@ -43,11 +43,15 @@ class AmbiguityCheck(BaseModel):
 
 
 async def check_ambiguity(state: AgentState) -> AgentState:
+    sql_executor = get_sql_executor()
+    if state.schema_description is None:
+        state.schema_description = sql_executor.get_schema()
+
     llm = get_llm_adapter().get_llm_client()
     structured_llm = llm.with_structured_output(AmbiguityCheck)
 
     messages = [
-        SystemMessage(content=AMBIGUITY_SYSTEM_PROMPT),
+        SystemMessage(content=build_ambiguity_system_prompt(state.schema_description)),
         HumanMessage(content=state.question),
     ]
 

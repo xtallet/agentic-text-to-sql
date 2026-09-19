@@ -42,6 +42,12 @@ class TestSqliteAdapter:
 
         assert "[REDACTED]" not in result
 
+    def test_execute_rounds_float_values(self, adapter):
+        result = adapter.execute("SELECT 0.1 + 0.2 AS Total")
+
+        assert "0.3" in result
+        assert "0.30000000000000004" not in result
+
     @pytest.mark.parametrize(
         "query",
         [

@@ -29,9 +29,14 @@ from app.graph import (
 class TestCheckAmbiguity:
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
+    @patch("app.graph.get_sql_executor")
     async def test_unambiguous_question_leaves_clarification_unset(
-        self, mock_get_llm_adapter
+        self, mock_get_sql_executor, mock_get_llm_adapter
     ):
+        mock_get_sql_executor.return_value.get_schema.return_value = (
+            "CREATE TABLE Artist (...)"
+        )
+
         structured_llm = AsyncMock()
         structured_llm.ainvoke.return_value = AmbiguityCheck(is_ambiguous=False)
         llm = MagicMock()
@@ -42,13 +47,19 @@ class TestCheckAmbiguity:
         result = await check_ambiguity(state)
 
         assert result.clarification is None
+        assert result.schema_description == "CREATE TABLE Artist (...)"
 
     @pytest.mark.asyncio
     @patch("app.graph.interrupt")
     @patch("app.graph.get_llm_adapter")
+    @patch("app.graph.get_sql_executor")
     async def test_ambiguous_question_interrupts_and_stores_clarification(
-        self, mock_get_llm_adapter, mock_interrupt
+        self, mock_get_sql_executor, mock_get_llm_adapter, mock_interrupt
     ):
+        mock_get_sql_executor.return_value.get_schema.return_value = (
+            "CREATE TABLE Invoice (...)"
+        )
+
         structured_llm = AsyncMock()
         structured_llm.ainvoke.return_value = AmbiguityCheck(
             is_ambiguous=True,
@@ -69,7 +80,14 @@ class TestCheckAmbiguity:
 
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
-    async def test_check_failure_fails_open(self, mock_get_llm_adapter):
+    @patch("app.graph.get_sql_executor")
+    async def test_check_failure_fails_open(
+        self, mock_get_sql_executor, mock_get_llm_adapter
+    ):
+        mock_get_sql_executor.return_value.get_schema.return_value = (
+            "CREATE TABLE Artist (...)"
+        )
+
         structured_llm = AsyncMock()
         structured_llm.ainvoke.side_effect = RuntimeError("LLM is down")
         llm = MagicMock()

@@ -1,11 +1,21 @@
-AMBIGUITY_SYSTEM_PROMPT = """
+def build_ambiguity_system_prompt(schema_description: str) -> str:
+    return f"""
 You are reviewing a natural language question that will be used to generate a SQL query
 against the Chinook music store database.
+
+Schema:
+{schema_description}
 
 Decide if the question is ambiguous in a way that could lead to a wrong or misleading answer
 if not clarified — for example, a relative time period given without a year (e.g. "Q3",
 "last year", "this month"), or a superlative ("best", "top") without specifying the metric to
 rank by.
+
+Only flag ambiguity, and only ask a clarifying question, if it can actually be resolved using
+the schema above. Do not invent a distinction that has no corresponding table or column in the
+schema (e.g. do not ask about a "type of revenue" like streaming vs. downloads if the schema has
+no such distinction) — the question you ask must be answerable by filtering or grouping on real
+columns.
 
 Do not flag it as ambiguous just because it is broad or open-ended — only flag it if answering
 without clarification is likely to produce a misleading or arbitrary result.
