@@ -204,6 +204,25 @@ async def generate_answer(state: AgentState) -> AgentState:
     return state
 
 
+def compute_confidence(state: AgentState) -> tuple[str, str]:
+    if state.answer_error:
+        return "low", "The final answer was not approved by self-evaluation."
+
+    if state.retry_count == 0 and state.answer_retry_count == 0:
+        return (
+            "high",
+            "No retries were needed; both self-evaluation checks approved on the "
+            "first pass.",
+        )
+
+    reasons = []
+    if state.retry_count > 0:
+        reasons.append(f"the SQL was regenerated {state.retry_count} time(s)")
+    if state.answer_retry_count > 0:
+        reasons.append(f"the answer was regenerated {state.answer_retry_count} time(s)")
+    return "medium", f"Confidence lowered because {' and '.join(reasons)}."
+
+
 async def evaluate_answer(state: AgentState) -> AgentState:
     llm = get_llm_adapter().get_llm_client()
     structured_llm = llm.with_structured_output(AnswerEvaluation)
@@ -238,6 +257,8 @@ async def evaluate_answer(state: AgentState) -> AgentState:
         logger.exception(
             f"Failed to self-evaluate generated answer for question '{state.question}'"
         )
+
+    state.confidence, state.confidence_reason = compute_confidence(state)
 
     return state
 

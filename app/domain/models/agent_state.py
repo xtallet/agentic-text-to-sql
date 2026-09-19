@@ -15,3 +15,5 @@ class AgentState(BaseModel):
     answer_error: str | None = None
     answer_retry_count: int = 0
     answer_evaluation_reason: str | None = None
+    confidence: str | None = None
+    confidence_reason: str | None = None

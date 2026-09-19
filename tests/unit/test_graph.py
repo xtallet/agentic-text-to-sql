@@ -15,6 +15,7 @@ from app.graph import (
     SqlQuery,
     check_ambiguity,
     compile_graph,
+    compute_confidence,
     evaluate_answer,
     evaluate_sql_result,
     execute_sql,
@@ -485,6 +486,7 @@ class TestEvaluateAnswer:
 
         assert result.answer_error is None
         assert result.answer_evaluation_reason == "Faithful to the result"
+        assert result.confidence == "high"
 
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
@@ -508,6 +510,7 @@ class TestEvaluateAnswer:
         result = await evaluate_answer(state)
 
         assert "Invented a number not present in the result" in result.answer_error
+        assert result.confidence == "low"
 
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
@@ -527,6 +530,43 @@ class TestEvaluateAnswer:
         result = await evaluate_answer(state)
 
         assert result.answer_error is None
+
+
+class TestComputeConfidence:
+    def test_high_when_no_retries_and_no_pending_error(self):
+        state = AgentState(question="q", retry_count=0, answer_retry_count=0)
+
+        level, reason = compute_confidence(state)
+
+        assert level == "high"
+
+    def test_medium_when_sql_needed_a_retry_but_was_accepted(self):
+        state = AgentState(question="q", retry_count=1, answer_retry_count=0)
+
+        level, reason = compute_confidence(state)
+
+        assert level == "medium"
+        assert "SQL was regenerated 1 time(s)" in reason
+
+    def test_medium_when_answer_needed_a_retry_but_was_accepted(self):
+        state = AgentState(question="q", retry_count=0, answer_retry_count=1)
+
+        level, reason = compute_confidence(state)
+
+        assert level == "medium"
+        assert "answer was regenerated 1 time(s)" in reason
+
+    def test_low_when_answer_error_still_set(self):
+        state = AgentState(
+            question="q",
+            retry_count=0,
+            answer_retry_count=MAX_ANSWER_RETRIES,
+            answer_error="still rejected",
+        )
+
+        level, reason = compute_confidence(state)
+
+        assert level == "low"
 
 
 class TestRouteAfterAnswerEvaluation:
