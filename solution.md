@@ -19,7 +19,7 @@ executes it against Chinook, and turns the result back into a natural language a
 two self-evaluation checkpoints, a bounded self-correction loop, and an optional
 human-in-the-loop pause for ambiguous questions.
 
-<p align="center"><img src="docs/agentic_txt_to_sql_diagram.png" alt="PyCharm Configuration" width="750"/></p>
+<p align="center"><img src="docs/agentic_txt_to_sql_diagram.png" alt="Agentic-txt-to-sql Diagram" width="750"/></p>
 
 #### 🧩 The codebase follows a hexagonal-architecture style:
 
@@ -32,6 +32,8 @@ human-in-the-loop pause for ambiguous questions.
 - **`app/infrastructure/`** — concrete adapters implementing the ports:<br> 
   `OpenAiLlmAdapter` (LangChain `ChatOpenAI` wrapper)<br> 
   `SqliteAdapter` (the actual safety boundary.<br> 
+  `services/langsmith.py` builds a per-question LangSmith run name/metadata/tags for
+  observability.<br>
   `di/dependencies.py` wires them up via small `lru_cache`-decorated factory functions —
   no DI framework, just memoized constructors.
 - **`app/graph.py`** — the LangGraph nodes (`async def node(state) -> state`) and
@@ -74,13 +76,24 @@ is validated against a schema before the node ever sees it.
 **🔌 Why OpenAI only?**<br> Chosen explicitly for this project. Multi-provider support was considered
 (it's a listed bonus) but not implemented.
 
+**🔭 Why LangSmith?**<br> The graph makes several LLM calls per question (ambiguity check, SQL
+generation, two self-evaluations, answer generation, plus retries) — without tracing,
+understanding *why* a particular retry happened means re-reading logs by hand. LangSmith gives
+each run a readable name (the question itself) and metadata, making the full chain of calls
+behind any answer inspectable. It's entirely optional (`LANGSMITH_*` env vars) — the app behaves
+identically without it.
+
 ## ⚙️ 3. How the agentic workflow operates
 In this section I am going to explain the workflow from scratch, starting from the user's question to the end - explaning what each node does, 
 
 **🤝 check_ambiguity** :<br> 
 A structured-output LLM call (`AmbiguityCheck(is_ambiguous, clarifying_question)`) judges whether the question is ambiguous
 in a way likely to produce a misleading or arbitrary answer — a relative time period with no
-year ("Q3", "last year"), or a superlative with no defined metric ("best-selling").<br> If so, it
+year ("Q3", "last year"), or a superlative with no defined metric ("best-selling").<br>
+It also receives the introspected schema (same `if state.schema_description is None` pattern as
+`generate_sql`), and is explicitly instructed to only flag ambiguity — or ask a clarifying
+question — that's actually resolvable via a real column, so it can't invent a dimension that has
+no corresponding table or column in the data model.<br> If so, it
 calls LangGraph's `interrupt()` with the clarifying question, which pauses the entire graph run
 and returns control to the caller. `main.py` detects the pause (`result.get("__interrupt__")`),
 prompts the user via `input()`, and resumes with `graph.ainvoke(Command(resume=answer), config)`
@@ -191,6 +204,18 @@ Both rejections reuse the exact same retry mechanism as a hard execution error �
 just sets `sql_error`/`answer_error`, and the rest of the graph (routing, retry counting, history
 accumulation) doesn't need to know or care **why** something is being retried.
 
+**📊 Confidence scoring**:<br>
+Both evaluators, and the retry loop, already produce meaningful signals — `retry_count`,
+`answer_retry_count`, and whether `answer_error` is still set after exhausting retries.
+`compute_confidence()` (`app/graph.py`) turns these into a `high`/`medium`/`low` label with a
+short human-readable reason, computed at the end of `evaluate_answer` and exposed to the user
+alongside every answer.<br> 
+No extra LLM call — it's a deterministic function of state that already
+existed.<br> 
+- **🟢 high** means no retries were needed at any stage.<br> 
+- **🟡 medium** means the SQL or the answer needed at least one regeneration but was ultimately approved.<br>
+- **🔴 low** means the final answer was never actually approved.
+
 ## 🛡️ 6. Guardrails
 
 The brief lists seven guardrail categories. All seven have a real mechanism behind them in this
@@ -300,12 +325,6 @@ detect PII in columns whose names do not explicitly indicate sensitive data.
   PII that ends up in unexpectedly-named or free-text columns.
 
 
-- **Explicit confidence scoring exposed to the user** (a listed bonus, not implemented): the raw
-  material already exists in state (`sql_evaluation_reason`, `answer_evaluation_reason`,
-  `retry_count`) but isn't currently surfaced or turned into a score. Cheap to add given the
-  data is already collected.
-
-
 - **Durable checkpointing** (Postgres/SQLite-backed instead of `InMemorySaver`), so HITL pauses
   survive process restarts and the system could be run as a long-lived service rather than a
   one-shot CLI process — the other half of the "checkpointing and resumability" bonus.
@@ -337,6 +356,8 @@ they're only "core requirements" in disguise**:
   `evaluate_answer` already are: independent LLM judges reviewing the pipeline's own output.
 - **Automatic retry strategies with different prompts** — the retry loop doesn't resend an
   identical prompt; it augments it with the accumulated failure history each time.
+- **Confidence scoring for answers** — implemented `compute_confidence()`, derived
+  from existing retry/evaluation signals with no extra LLM call needed.
 
 ## 🧑🤖 10. Use of AI during development
 
@@ -354,8 +375,6 @@ pattern I provided from that existing project, rather than being designed from s
 Every line Claude Code produced was still reviewed by me in a step-by-step debugger session, pausing whenever
 necessary to confirm the code actually did what had been asked before moving on to the next phase — 
 which is precisely how the real bugs documented were caught.
-
-The 
 
 **Responsibilities** :
 <br>
