@@ -1,3 +1,5 @@
+import asyncio
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -5,6 +7,7 @@ from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from app.config.logger import setup_logging
+from app.config.settings import get_settings
 from app.domain.models.agent_state import AgentState
 from app.domain.prompts.injection_guard import wrap_untrusted
 from app.domain.prompts.sql_generation import (
@@ -45,7 +48,7 @@ class AmbiguityCheck(BaseModel):
 async def check_ambiguity(state: AgentState) -> AgentState:
     sql_executor = get_sql_executor()
     if state.schema_description is None:
-        state.schema_description = sql_executor.get_schema()
+        state.schema_description = await asyncio.to_thread(sql_executor.get_schema)
 
     llm = get_llm_adapter().get_llm_client()
     structured_llm = llm.with_structured_output(AmbiguityCheck)
@@ -71,7 +74,7 @@ async def check_ambiguity(state: AgentState) -> AgentState:
 async def generate_sql(state: AgentState) -> AgentState:
     sql_executor = get_sql_executor()
     if state.schema_description is None:
-        state.schema_description = sql_executor.get_schema()
+        state.schema_description = await asyncio.to_thread(sql_executor.get_schema)
 
     llm = get_llm_adapter().get_llm_client()
     structured_llm = llm.with_structured_output(SqlQuery)
@@ -124,7 +127,9 @@ async def execute_sql(state: AgentState) -> AgentState:
 
     sql_executor = get_sql_executor()
     try:
-        state.sql_result = sql_executor.execute(state.sql_query)
+        state.sql_result = await asyncio.to_thread(
+            sql_executor.execute, state.sql_query
+        )
     except Exception as e:
         logger.warning(f"Failed to execute SQL '{state.sql_query}': {e}")
         state.sql_error = str(e)
@@ -288,6 +293,8 @@ def route_after_answer_evaluation(state: AgentState) -> str:
 
 
 async def compile_graph():
+    await asyncio.to_thread(get_settings)
+
     agent_graph = StateGraph(AgentState)
 
     agent_graph.add_node("check_ambiguity", check_ambiguity)
