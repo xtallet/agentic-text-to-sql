@@ -268,6 +268,17 @@ detect PII in columns whose names do not explicitly indicate sensitive data.
   would need to think about connection pooling for `SqliteAdapter` (currently a fresh
   connection per call) and LLM-call concurrency limits.
 
+
+- **🧵 Blocking calls inside async nodes, found via `langgraph dev`'s ASGI server.**<br>
+  `SqliteAdapter` uses the synchronous `sqlite3` module, and `OpenAiLlmAdapter.get_llm_client()`
+  was constructing a fresh `Settings()` — re-reading `.env` from disk — on *every* LLM call.
+  Running the CLI single-process, this went unnoticed; running under `langgraph dev`'s real ASGI
+  server, it surfaced immediately as a `BlockingError` (the dev server actively detects
+  synchronous I/O tying up the event loop).<br> 
+  Fixed by wrapping the `sqlite3` calls in `asyncio.to_thread()`, and by caching `Settings()` 
+  behind a `get_settings()` singleton, pre-warmed once in `compile_graph()` before any node runs — 
+  so the one unavoidable disk read happens off the event loop, and every later call is a cache hit.
+
 ## ⚖️ 8. Trade-offs
 
 - **⚠️ Self-evaluation is not infallible, and the retry loop can make things worse, not better.**
@@ -373,6 +384,50 @@ they're only "core requirements" in disguise**:
   identical prompt; it augments it with the accumulated failure history each time.
 - **Confidence scoring for answers** — implemented `compute_confidence()`, derived
   from existing retry/evaluation signals with no extra LLM call needed.
+
+**💡 Interesting Bonus points, with concrete ideas for each one**
+(the brief lists ten; five are covered above, these five are not — listed honestly rather than
+pretending they weren't worth doing):
+
+- **🔀 Model routing** — the one I'd most like to try. Concretely: let `generate_sql`'s *second
+  and third* attempts (after a retry) escalate to a stronger model than the first attempt used —
+  if a cheap model already failed twice, that's a real signal the question needs more reasoning
+  power, not just another roll of the dice with the same model.<br>
+  A second angle: let the user pick the provider/model themselves via an env var or CLI flag, 
+  trading cost for quality depending on how much they trust the question to be easy.
+
+
+- **🔌 Support for multiple LLM providers** — the natural companion to model routing above.
+  Concretely: if `generate_sql` escalates to "a stronger model" on retry, that model doesn't have
+  to be another OpenAI model — it could just as well be Anthropic's or Google's best reasoning
+  model for that specific step. It would also give real fallback behavior: if OpenAI has an
+  outage or rate-limits us mid-question, retry against a different provider entirely instead of
+  failing the whole run.
+
+
+- **📡 Streaming responses** — a full run can take 5+ sequential LLM calls (ambiguity check, SQL
+  generation, evaluation, answer, evaluation), which is several seconds of silence in the
+  terminal today. Concretely: stream short progress markers as each node completes ("Checking
+  your question...", "Writing the query...", "Verifying the result..."), or stream the final
+  answer token-by-token once `generate_answer` starts — either would make the wait feel much
+  shorter without changing what the system actually does.
+
+
+- **⚡ Parallel agent execution** — concretely: generate 2-3 candidate SQL queries in parallel
+  (same prompt, different temperature/sampling) instead of one, and have `evaluate_sql_result`
+  pick the best of the batch instead of judging a single candidate in isolation. This could
+  meaningfully reduce the retry cycles — instead of a rejected query triggering
+  a fresh, sequential LLM round-trip, there could already be a second reasonable candidate
+  sitting there ready to be picked.
+
+
+- **💰 Cost optimization** — concretely: a simple cache keyed by the exact question text, so
+  asking the same canonical question twice (very common while testing/demoing, as this whole
+  project's own session log shows) doesn't re-run 5 LLM calls for an answer that's already
+  known.<br> 
+  A second angle: actually aggregate the per-run token/cost data LangSmith already
+  captures into a visible running total, instead of it only existing per-trace in the LangSmith
+  UI.
 
 ## 🧑🤖 10. Use of AI during development
 
