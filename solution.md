@@ -291,7 +291,22 @@ detect PII in columns whose names do not explicitly indicate sensitive data.
   more robust than trying to make the evaluator smarter about inferring things it can't see.<br>
   The residual risk remains structural: any future false rejection *not* covered by these two
   specific rules is subject to the same failure mode.
-  
+
+
+- **🧮 A wrong answer that passed both evaluators — the opposite, more serious failure mode.**
+  For *"Which artist generated the highest revenue in 2012?"* (one of the brief's own example
+  questions), the generated SQL joined `Invoice -> InvoiceLine -> Track -> Album -> Artist` and
+  summed `Invoice.Total` per artist. This is a classic SQL fan-out bug: `Invoice.Total` lives at
+  the *invoice* grain, but the join operates at *invoice-line* grain, so an invoice's full total
+  gets counted once per matching line item. Verified against the real DB: the query reported
+  Iron Maiden's 2012 revenue as **$298.98**; the correct figure
+  (`SUM(InvoiceLine.UnitPrice * InvoiceLine.Quantity)`) is ** $33.66** — from 34 matching invoice
+  lines across only 7 distinct invoices, each counted several times over.<br> 
+  Both `evaluate_sql_result` and `evaluate_answer` approved the result, because neither re-derives the
+  arithmetic independently — they judge plausibility against the question, which a ~9x-inflated
+  but structurally reasonable-looking number passes easily. Unlike the false rejections above,
+  where a **good** answer was wrongly blocked, this is a **bad** answer that sailed straight through.
+
 
 - **🩺 The retry loop's error feedback is a diagnosis, not a fix.** When `evaluate_sql_result`
   rejects a result with "this is empty and shouldn't be" (as happened for a Q3-with-no-year
