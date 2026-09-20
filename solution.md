@@ -76,6 +76,14 @@ is validated against a schema before the node ever sees it.
 **🔌 Why OpenAI only?**<br> Chosen explicitly for this project. Multi-provider support was considered
 (it's a listed bonus) but not implemented.
 
+**💸 Why gpt-4o-mini specifically?**<br> A single question already triggers 5+ sequential LLM
+calls (ambiguity check, SQL generation, two self-evaluations, answer generation, plus any
+retries), so cost and latency compound fast — and every task each node performs (classification,
+structured-output judgment, SQL generation over Chinook's small, well-defined schema) doesn't
+need a frontier-tier model to do well. Real spend across the whole project stayed at a few
+cents. It's also exactly why "Model routing" is the bonus I'd try next — escalating to a
+stronger model only for the specific calls that actually need it, instead of defaulting.
+
 **🔭 Why LangSmith?**<br> The graph makes several LLM calls per question (ambiguity check, SQL
 generation, two self-evaluations, answer generation, plus retries) — without tracing,
 understanding *why* a particular retry happened means re-reading logs by hand. LangSmith gives
@@ -356,23 +364,11 @@ detect PII in columns whose names do not explicitly indicate sensitive data.
   one-shot CLI process — the other half of the "checkpointing and resumability" bonus.
 
 
-- **Model routing**, considered but deferred: routing cheap classification-style nodes
-  (`check_ambiguity`, `evaluate_sql_result`, `evaluate_answer`) to a smaller/cheaper model while
-  reserving a stronger one for `generate_sql` specifically, or escalating to a stronger model on
-  the second/third SQL retry once a cheaper model has already failed twice.
-
-
-- **Multi-provider support**, also deferred: the `LLMPort` abstraction already exists
-  specifically to make this swap-in feasible without touching graph logic, but no second
-  provider adapter was written.
-
-
 - **Schema retrieval instead of full-schema-in-prompt**, for scaling to a database much larger
   than Chinook.
 
-
-- **Streaming responses**: the CLI currently blocks until the full graph run completes; no
-  token-level or step-level streaming to the terminal.
+(Model routing, multi-provider support, and streaming responses are also on the list — see the
+bonus breakdown right below, where each gets a concrete example)
 
 **🏆 Bonus points already substantially covered, worth calling out explicitly rather than assuming
 they're only "core requirements" in disguise**:
