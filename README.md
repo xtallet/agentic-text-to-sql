@@ -95,6 +95,7 @@ To see the graph in action you can also use LangGraph Studio, to inspect the gra
 ```bash
 uv run langgraph dev
 ```
+<p align="center"><img src="docs/langgraph_studio.PNG" alt="LangGraph Studio" width="750"/></p>
 
 ### 🔭 LangSmith tracing (optional)
 
