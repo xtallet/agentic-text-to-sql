@@ -40,6 +40,7 @@ uv sync
 ```bash
 uv clean
 deactivate
+rm -rf .venv
 uv venv
 source .venv/bin/activate
 uv sync
