@@ -23,7 +23,7 @@ human-in-the-loop pause for ambiguous questions.
 
 #### 🧩 The codebase follows a hexagonal-architecture style:
 
-- **`app/domain/`** — pure business logic, no framework/IO dependencies.<br>
+- **`app/domain/`** — pure application logic, no framework/IO dependencies.<br>
   `models/agent_state.py` defines the LangGraph state (a plain pydantic `BaseModel`).<br> 
   `ports/` defines two small ABCs (`LLMPort`, `SqlExecutorPort`) that the graph depends on as abstractions, not concrete
   implementations.<br> 
@@ -39,9 +39,9 @@ human-in-the-loop pause for ambiguous questions.
 - **`app/graph.py`** — the LangGraph nodes (`async def node(state) -> state`) and
   `compile_graph()`, which is the only place that knows the graph's shape.
 - **`app/main.py`** — a thin CLI entrypoint that also owns the human-in-the-loop
-  interrupt/resume interaction loop (see §3).
+  interrupt/resume interaction loop.
 
-**💡Why hexagonal architecture?**<br> Business logic never depends on concrete technical details
+**💡Why hexagonal architecture?**<br> Application logic never depends on concrete technical details
 (which LLM, which database) — only on the abstract ports.<br> 
 This is what lets the integration tests swap `OpenAiLlmAdapter` for a fake `ScriptedLlmAdapter` without touching `graph.py` at
 all.<br> 
@@ -92,7 +92,7 @@ behind any answer inspectable. It's entirely optional (`LANGSMITH_*` env vars) �
 identically without it.
 
 ## ⚙️ 3. How the agentic workflow operates
-In this section I am going to explain the workflow from scratch, starting from the user's question to the end - explaning what each node does, 
+In this section I am going to explain the workflow from scratch, starting from the user's question to the end - explaning what each node does.
 
 **🤝 check_ambiguity** :<br> 
 A structured-output LLM call (`AmbiguityCheck(is_ambiguous, clarifying_question)`) judges whether the question is ambiguous
@@ -130,15 +130,16 @@ so a rejected query never reaches the database at all.<br>
 This node has 3 Conditional Edges :<br>
 1 - If the SQL sentence runs well, it goes to the **evaluate_sql_result** node.<br>
 2 - If the SQL sentence returns an error, it returns to the **generate_sql** node, incrementing the retry count +1.<br>
-3 - If the SQL sentence is still failing and retry count is > 2, then it goes to the **generate_answer** node.
+3 - If the SQL sentence is still failing and retry count is >= 2, then it goes to the **generate_answer** node.
 
 **🧠 evaluate_sql_result** :<br> 
 A second, independent LLM call judges whether the *result* actually
 answers the question — not just "did it execute without error". <br>
 This is the first self-evaluation checkpoint.<br>
-This node has 2 Conditional Edges :<br>
+This node has 3 Conditional Edges :<br>
 1 - If it considers the SQL result answers the user's question, then it goes to the **generate_answer** node.<br>
-2 - If it considers the SQL result does not answer the user's question, then it goes back to the **generate_sql** node, to give the LLM the opportunity to generate a new SQL sentence.  
+2 - If it considers the SQL result does not answer the user's question, then it goes back to the **generate_sql** node, to give the LLM the opportunity to generate a new SQL sentence.<br>
+3 - If the SQL result is still not approved by the model and retry count is >=2, then it goes to the **generate_answer** node.
 
 **💬 generate_answer** :<br> 
 Turns the result (or the accumulated error) into a natural-language

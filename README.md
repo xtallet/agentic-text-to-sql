@@ -97,7 +97,7 @@ uv run langgraph dev
 ```
 <p align="center"><img src="docs/langgraph_studio.PNG" alt="LangGraph Studio" width="750"/></p>
 
-### 🔭 LangSmith tracing (optional)
+### 🔭 LangSmith tracing
 
 If you fill in the `LANGSMITH_*` variables in `.env`, every run is traced to
 [LangSmith](https://smith.langchain.com) with a readable run name (the question itself),
