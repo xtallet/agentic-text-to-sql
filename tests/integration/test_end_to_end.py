@@ -167,12 +167,6 @@ class TestHumanInTheLoop:
                 is_ambiguous=True,
                 clarifying_question="Which year's Q3 do you mean?",
             ),
-            # check_ambiguity re-runs in full on resume, so a second canned
-            # classification is needed before interrupt() returns the resume value.
-            AmbiguityCheck(
-                is_ambiguous=True,
-                clarifying_question="Which year's Q3 do you mean?",
-            ),
             SqlQuery(query="SELECT COUNT(*) AS TrackCount FROM Track"),
             SqlEvaluation(is_valid=True, reason="Matches the question"),
             SimpleNamespace(content="There are 3,503 tracks in the database."),
@@ -197,5 +191,5 @@ class TestHumanInTheLoop:
         assert result["clarification"] == "2012"
         assert result["answer"] == "There are 3,503 tracks in the database."
 
-        sql_generation_prompt = adapter.client.calls[2][1].content
+        sql_generation_prompt = adapter.client.calls[1][1].content
         assert "User clarification: 2012" in sql_generation_prompt

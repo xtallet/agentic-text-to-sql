@@ -21,6 +21,8 @@ from app.graph import (
     execute_sql,
     generate_answer,
     generate_sql,
+    request_clarification,
+    route_after_ambiguity_check,
     route_after_answer_evaluation,
     route_after_evaluate,
     route_after_execute,
@@ -31,7 +33,7 @@ class TestCheckAmbiguity:
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
     @patch("app.graph.get_sql_executor")
-    async def test_unambiguous_question_leaves_clarification_unset(
+    async def test_unambiguous_question_leaves_pending_question_unset(
         self, mock_get_sql_executor, mock_get_llm_adapter
     ):
         mock_get_sql_executor.return_value.get_schema.return_value = (
@@ -47,15 +49,14 @@ class TestCheckAmbiguity:
         state = AgentState(question="How many tracks are there?")
         result = await check_ambiguity(state)
 
-        assert result.clarification is None
+        assert result.pending_clarifying_question is None
         assert result.schema_description == "CREATE TABLE Artist (...)"
 
     @pytest.mark.asyncio
-    @patch("app.graph.interrupt")
     @patch("app.graph.get_llm_adapter")
     @patch("app.graph.get_sql_executor")
-    async def test_ambiguous_question_interrupts_and_stores_clarification(
-        self, mock_get_sql_executor, mock_get_llm_adapter, mock_interrupt
+    async def test_ambiguous_question_stores_pending_clarifying_question(
+        self, mock_get_sql_executor, mock_get_llm_adapter
     ):
         mock_get_sql_executor.return_value.get_schema.return_value = (
             "CREATE TABLE Invoice (...)"
@@ -69,15 +70,12 @@ class TestCheckAmbiguity:
         llm = MagicMock()
         llm.with_structured_output.return_value = structured_llm
         mock_get_llm_adapter.return_value.get_llm_client.return_value = llm
-        mock_interrupt.return_value = "2012"
 
         state = AgentState(question="Top employee by invoices in Q3?")
         result = await check_ambiguity(state)
 
-        mock_interrupt.assert_called_once_with(
-            {"question": "Which year's Q3 do you mean?"}
-        )
-        assert result.clarification == "2012"
+        assert result.pending_clarifying_question == "Which year's Q3 do you mean?"
+        assert result.clarification is None
 
     @pytest.mark.asyncio
     @patch("app.graph.get_llm_adapter")
@@ -98,7 +96,35 @@ class TestCheckAmbiguity:
         state = AgentState(question="How many tracks are there?")
         result = await check_ambiguity(state)
 
-        assert result.clarification is None
+        assert result.pending_clarifying_question is None
+
+
+class TestRequestClarification:
+    @pytest.mark.asyncio
+    @patch("app.graph.interrupt")
+    async def test_stores_resume_value_as_clarification(self, mock_interrupt):
+        mock_interrupt.return_value = "2012"
+
+        state = AgentState(
+            question="Top employee by invoices in Q3?",
+            pending_clarifying_question="Which year's Q3 do you mean?",
+        )
+        result = await request_clarification(state)
+
+        mock_interrupt.assert_called_once_with(
+            {"question": "Which year's Q3 do you mean?"}
+        )
+        assert result.clarification == "2012"
+
+
+class TestRouteAfterAmbiguityCheck:
+    def test_routes_to_request_clarification_when_question_is_pending(self):
+        state = AgentState(question="...", pending_clarifying_question="Which year?")
+        assert route_after_ambiguity_check(state) == "request_clarification"
+
+    def test_routes_to_generate_sql_when_nothing_pending(self):
+        state = AgentState(question="...")
+        assert route_after_ambiguity_check(state) == "generate_sql"
 
 
 class TestGenerateSql:
@@ -604,6 +630,7 @@ class TestCompileGraph:
 
         expected_nodes = [
             ("check_ambiguity", check_ambiguity),
+            ("request_clarification", request_clarification),
             ("generate_sql", generate_sql),
             ("execute_sql", execute_sql),
             ("evaluate_sql_result", evaluate_sql_result),
@@ -615,9 +642,17 @@ class TestCompileGraph:
         assert mock_graph.add_node.call_count == len(expected_nodes)
 
         mock_graph.add_edge.assert_any_call(START, "check_ambiguity")
-        mock_graph.add_edge.assert_any_call("check_ambiguity", "generate_sql")
+        mock_graph.add_edge.assert_any_call("request_clarification", "generate_sql")
         mock_graph.add_edge.assert_any_call("generate_sql", "execute_sql")
         mock_graph.add_edge.assert_any_call("generate_answer", "evaluate_answer")
+        mock_graph.add_conditional_edges.assert_any_call(
+            "check_ambiguity",
+            route_after_ambiguity_check,
+            {
+                "request_clarification": "request_clarification",
+                "generate_sql": "generate_sql",
+            },
+        )
         mock_graph.add_conditional_edges.assert_any_call(
             "execute_sql",
             route_after_execute,
@@ -637,7 +672,7 @@ class TestCompileGraph:
             route_after_answer_evaluation,
             {"generate_answer": "generate_answer", "end": END},
         )
-        assert mock_graph.add_conditional_edges.call_count == 3
+        assert mock_graph.add_conditional_edges.call_count == 4
 
         mock_graph.compile.assert_called_once()
         _, compile_kwargs = mock_graph.compile.call_args
