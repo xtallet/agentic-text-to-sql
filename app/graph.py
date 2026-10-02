@@ -66,9 +66,20 @@ async def check_ambiguity(state: AgentState) -> AgentState:
         return state
 
     if check.is_ambiguous and check.clarifying_question:
-        state.clarification = interrupt({"question": check.clarifying_question})
+        state.pending_clarifying_question = check.clarifying_question
 
     return state
+
+
+async def request_clarification(state: AgentState) -> AgentState:
+    state.clarification = interrupt({"question": state.pending_clarifying_question})
+    return state
+
+
+def route_after_ambiguity_check(state: AgentState) -> str:
+    if state.pending_clarifying_question:
+        return "request_clarification"
+    return "generate_sql"
 
 
 async def generate_sql(state: AgentState) -> AgentState:
@@ -298,6 +309,7 @@ async def compile_graph():
     agent_graph = StateGraph(AgentState)
 
     agent_graph.add_node("check_ambiguity", check_ambiguity)
+    agent_graph.add_node("request_clarification", request_clarification)
     agent_graph.add_node("generate_sql", generate_sql)
     agent_graph.add_node("execute_sql", execute_sql)
     agent_graph.add_node("evaluate_sql_result", evaluate_sql_result)
@@ -305,7 +317,15 @@ async def compile_graph():
     agent_graph.add_node("evaluate_answer", evaluate_answer)
 
     agent_graph.add_edge(START, "check_ambiguity")
-    agent_graph.add_edge("check_ambiguity", "generate_sql")
+    agent_graph.add_conditional_edges(
+        "check_ambiguity",
+        route_after_ambiguity_check,
+        {
+            "request_clarification": "request_clarification",
+            "generate_sql": "generate_sql",
+        },
+    )
+    agent_graph.add_edge("request_clarification", "generate_sql")
     agent_graph.add_edge("generate_sql", "execute_sql")
     agent_graph.add_conditional_edges(
         "execute_sql",
