@@ -13,6 +13,7 @@ from app.domain.prompts.injection_guard import wrap_untrusted
 from app.domain.prompts.sql_generation import (
     ANSWER_EVALUATION_SYSTEM_PROMPT,
     ANSWER_SYSTEM_PROMPT,
+    CLARIFICATION_EVALUATION_SYSTEM_PROMPT,
     EVALUATION_SYSTEM_PROMPT,
     build_ambiguity_system_prompt,
     build_sql_system_prompt,
@@ -24,6 +25,7 @@ logger = setup_logging()(__name__)
 
 MAX_SQL_RETRIES = 2
 MAX_ANSWER_RETRIES = 1
+MAX_CLARIFICATION_RETRIES = 1
 
 
 class SqlQuery(BaseModel):
@@ -43,6 +45,11 @@ class AnswerEvaluation(BaseModel):
 class AmbiguityCheck(BaseModel):
     is_ambiguous: bool
     clarifying_question: str | None = None
+
+
+class ClarificationEvaluation(BaseModel):
+    is_sufficient: bool
+    reason: str
 
 
 async def check_ambiguity(state: AgentState) -> AgentState:
@@ -72,12 +79,60 @@ async def check_ambiguity(state: AgentState) -> AgentState:
 
 
 async def request_clarification(state: AgentState) -> AgentState:
-    state.clarification = interrupt({"question": state.pending_clarifying_question})
+    question = state.pending_clarifying_question
+    if state.clarification_error:
+        state.clarification_retry_count += 1
+        question = (
+            f"{question}\n\n(Your previous answer wasn't clear enough: "
+            f"{state.clarification_error})"
+        )
+
+    state.clarification_error = None
+    state.clarification_evaluation_reason = None
+    state.clarification = interrupt({"question": question})
+    return state
+
+
+async def evaluate_clarification(state: AgentState) -> AgentState:
+    llm = get_llm_adapter().get_llm_client()
+    structured_llm = llm.with_structured_output(ClarificationEvaluation)
+
+    messages = [
+        SystemMessage(content=CLARIFICATION_EVALUATION_SYSTEM_PROMPT),
+        HumanMessage(
+            content=(
+                f"Original question: {state.question}\n"
+                f"Clarifying question asked: {state.pending_clarifying_question}\n"
+                f"User's answer:\n{wrap_untrusted(state.clarification or '')}"
+            )
+        ),
+    ]
+
+    try:
+        evaluation: ClarificationEvaluation = await structured_llm.ainvoke(messages)
+        state.clarification_evaluation_reason = evaluation.reason
+        if not evaluation.is_sufficient:
+            state.clarification_error = evaluation.reason
+    except Exception:
+        # Fail open: an evaluator error shouldn't block an otherwise valid clarification.
+        logger.exception(
+            f"Failed to self-evaluate clarification for question '{state.question}'"
+        )
+
     return state
 
 
 def route_after_ambiguity_check(state: AgentState) -> str:
     if state.pending_clarifying_question:
+        return "request_clarification"
+    return "generate_sql"
+
+
+def route_after_clarification_evaluation(state: AgentState) -> str:
+    if (
+        state.clarification_error
+        and state.clarification_retry_count < MAX_CLARIFICATION_RETRIES
+    ):
         return "request_clarification"
     return "generate_sql"
 
@@ -310,6 +365,7 @@ async def compile_graph():
 
     agent_graph.add_node("check_ambiguity", check_ambiguity)
     agent_graph.add_node("request_clarification", request_clarification)
+    agent_graph.add_node("evaluate_clarification", evaluate_clarification)
     agent_graph.add_node("generate_sql", generate_sql)
     agent_graph.add_node("execute_sql", execute_sql)
     agent_graph.add_node("evaluate_sql_result", evaluate_sql_result)
@@ -325,7 +381,15 @@ async def compile_graph():
             "generate_sql": "generate_sql",
         },
     )
-    agent_graph.add_edge("request_clarification", "generate_sql")
+    agent_graph.add_edge("request_clarification", "evaluate_clarification")
+    agent_graph.add_conditional_edges(
+        "evaluate_clarification",
+        route_after_clarification_evaluation,
+        {
+            "request_clarification": "request_clarification",
+            "generate_sql": "generate_sql",
+        },
+    )
     agent_graph.add_edge("generate_sql", "execute_sql")
     agent_graph.add_conditional_edges(
         "execute_sql",

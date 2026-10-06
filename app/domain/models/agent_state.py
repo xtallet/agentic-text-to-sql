@@ -5,6 +5,9 @@ class AgentState(BaseModel):
     question: str
     clarification: str | None = None
     pending_clarifying_question: str | None = None
+    clarification_error: str | None = None
+    clarification_retry_count: int = 0
+    clarification_evaluation_reason: str | None = None
     schema_description: str | None = None
     sql_query: str | None = None
     sql_result: str | None = None
