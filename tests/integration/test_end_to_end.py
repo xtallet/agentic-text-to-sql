@@ -6,9 +6,11 @@ import pytest
 from langgraph.types import Command
 
 from app.graph import (
+    MAX_CLARIFICATION_RETRIES,
     MAX_SQL_RETRIES,
     AmbiguityCheck,
     AnswerEvaluation,
+    ClarificationEvaluation,
     SqlEvaluation,
     SqlQuery,
     compile_graph,
@@ -167,6 +169,7 @@ class TestHumanInTheLoop:
                 is_ambiguous=True,
                 clarifying_question="Which year's Q3 do you mean?",
             ),
+            ClarificationEvaluation(is_sufficient=True, reason="Gives a specific year"),
             SqlQuery(query="SELECT COUNT(*) AS TrackCount FROM Track"),
             SqlEvaluation(is_valid=True, reason="Matches the question"),
             SimpleNamespace(content="There are 3,503 tracks in the database."),
@@ -191,5 +194,92 @@ class TestHumanInTheLoop:
         assert result["clarification"] == "2012"
         assert result["answer"] == "There are 3,503 tracks in the database."
 
-        sql_generation_prompt = adapter.client.calls[1][1].content
+        sql_generation_prompt = adapter.client.calls[2][1].content
         assert "User clarification: 2012" in sql_generation_prompt
+
+
+class TestClarificationRetryRecovery:
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_recovers_after_one_insufficient_clarification(
+        self, mock_get_llm_adapter
+    ):
+        script = [
+            AmbiguityCheck(
+                is_ambiguous=True,
+                clarifying_question="Which year's Q3 do you mean?",
+            ),
+            ClarificationEvaluation(
+                is_sufficient=False, reason="Doesn't specify a year"
+            ),
+            ClarificationEvaluation(is_sufficient=True, reason="Gives a specific year"),
+            SqlQuery(query="SELECT COUNT(*) AS TrackCount FROM Track"),
+            SqlEvaluation(is_valid=True, reason="Matches the question"),
+            SimpleNamespace(content="There are 3,503 tracks in the database."),
+            AnswerEvaluation(is_valid=True, reason="Faithful to the result"),
+        ]
+        mock_get_llm_adapter.return_value = ScriptedLlmAdapter(script)
+
+        graph = await compile_graph()
+        config = _config()
+        result = await graph.ainvoke(
+            {"question": "Which employee sold the most invoices in Q3?"}, config
+        )
+        assert result["__interrupt__"][0].value["question"] == (
+            "Which year's Q3 do you mean?"
+        )
+
+        result = await graph.ainvoke(Command(resume="sometime in Q3"), config)
+        assert "__interrupt__" in result
+        assert result["__interrupt__"][0].value["question"] == (
+            "Which year's Q3 do you mean?\n\n"
+            "(Your previous answer wasn't clear enough: Doesn't specify a year)"
+        )
+        # request_clarification's own increment of clarification_retry_count is only
+        # checkpointed once that node completes (i.e. after the *next* resume) — see
+        # the "Fix: HITL replay..." note in CLAUDE.md: mutations made before a node's
+        # own interrupt() call aren't persisted across that pause.
+
+        result = await graph.ainvoke(Command(resume="2012"), config)
+        assert result["clarification"] == "2012"
+        assert result["clarification_retry_count"] == 1
+        assert result["answer"] == "There are 3,503 tracks in the database."
+
+
+class TestClarificationRetryExhaustion:
+    @pytest.mark.asyncio
+    @patch("app.graph.get_llm_adapter")
+    async def test_proceeds_anyway_after_max_clarification_retries(
+        self, mock_get_llm_adapter
+    ):
+        script = [
+            AmbiguityCheck(
+                is_ambiguous=True,
+                clarifying_question="Which year's Q3 do you mean?",
+            ),
+            ClarificationEvaluation(
+                is_sufficient=False, reason="Doesn't specify a year"
+            ),
+            ClarificationEvaluation(
+                is_sufficient=False, reason="Still doesn't specify a year"
+            ),
+            SqlQuery(query="SELECT COUNT(*) AS TrackCount FROM Track"),
+            SqlEvaluation(is_valid=True, reason="Matches the question"),
+            SimpleNamespace(content="There are 3,503 tracks in the database."),
+            AnswerEvaluation(is_valid=True, reason="Faithful to the result"),
+        ]
+        mock_get_llm_adapter.return_value = ScriptedLlmAdapter(script)
+
+        graph = await compile_graph()
+        config = _config()
+        await graph.ainvoke(
+            {"question": "Which employee sold the most invoices in Q3?"}, config
+        )
+
+        result = await graph.ainvoke(Command(resume="sometime in Q3"), config)
+        assert "__interrupt__" in result
+
+        result = await graph.ainvoke(Command(resume="still vague"), config)
+        assert "__interrupt__" not in result
+        assert result["clarification_retry_count"] == MAX_CLARIFICATION_RETRIES
+        assert result["answer"] == "There are 3,503 tracks in the database."
